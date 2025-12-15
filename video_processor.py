@@ -1,4 +1,3 @@
-import torch
 import torch.nn.functional as F
 import os
 import numpy as np
@@ -6,238 +5,203 @@ import json
 import cv2
 from ultralytics import YOLO
 from collections import defaultdict, deque
-from PIL import Image
 import logging
 import psutil
 import time
 from convert import get_embedding
+import warnings
 from kalmanfilter import KalmanFilter
 
+# Suppress specific warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, message="Specified provider 'CUDAExecutionProvider' is not in available provider names")
+
 # Setup logging
-logging.basicConfig(level='INFO')  # Will be overridden by args.log_level in process_video
+logging.basicConfig(level='INFO')
 
 def cosine_similarity(a, b):
-    """Compute cosine similarity between two vectors."""
     return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
 
-def process_video(args, model, device):
-    """Process video with human tracking, face embedding, DB matching, and re-identification."""
+def process_video(args):
     logging.getLogger().setLevel(getattr(logging, args.log_level.upper()))
     
     if not args.video_path or not os.path.exists(args.video_path):
         raise ValueError(f"Video not found: {args.video_path}")
     
-    # Load DB
     with open(args.db_path, 'r') as f:
         db = json.load(f)
-    db_embeddings = {name: np.array(emb) for name, emb in db.items() if emb}
-    if not db_embeddings:
-        raise ValueError("Empty DB - build it first with --build_db")
+    db_embs = {n: np.array(e) for n, e in db.items() if e}
+    if not db_embs:
+        raise ValueError("Empty DB")
     
-    # Load YOLOv8
-    yolo = YOLO('yolov8m.pt') 
+    yolo = YOLO('yolov8m.pt')
     
-    # Open video
     cap = cv2.VideoCapture(args.video_path)
     if not cap.isOpened():
-        raise ValueError("Could not open video")
+        raise ValueError("Open video failed")
     fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    out = cv2.VideoWriter(args.output_video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
+    w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out = cv2.VideoWriter(args.output_video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
     
-    # Re-ID structures
-    known_persons = {}  # person_id -> {'avg_emb': np.array or None, 'name': str or None, 'last_score': float or None}
-    next_person_id = 0
+    known_p = {}
+    next_pid = 0
     
-    # Track state: track_id -> {'embeddings': deque, 'person_id': int or None, 'frame_count': 0, 'kalman': KalmanFilter, 'last_detection': np.array, 'missed_frames': 0}
-    tracks = defaultdict(lambda: {'embeddings': deque(maxlen=args.max_embs_per_track), 'person_id': None, 'frame_count': 0, 'kalman': None, 'last_detection': None, 'missed_frames': 0})
+    tracks = defaultdict(lambda: {'embs': deque(maxlen=args.max_embs_per_track), 'pid': None, 'fc': 0, 'kal': None, 'ld': None, 'mf': 0})
     
-    frame_num = 0
-    frame_times = deque(maxlen=10)  # For rolling FPS
-    start_time = time.time()
+    fn = 0
+    ft = deque(maxlen=10)
     
     while cap.isOpened():
-        frame_start = time.time()
+        fs = time.time()
         ret, frame = cap.read()
-        if not ret:
-            break
-        frame_num += 1
-        orig_frame = frame.copy()  # For annotation
+        if not ret: break
+        fn += 1
+        of = frame.copy()
         
-        # YOLO track persons (every frame)
-        results = yolo.track(frame, persist=True, classes=0, conf=args.conf_threshold, iou=args.iou_threshold)
+        res = yolo.track(frame, persist=True, classes=0, conf=args.conf_threshold, iou=args.iou_threshold)
         
-        detected_tracks = set()  # Tracks detected this frame
+        dt = set()
         
-        for result in results[0].boxes:
-            if not result.id:
-                continue
-            track_id = int(result.id)
-            bbox = result.xyxy[0].cpu().numpy()  # [x1, y1, x2, y2]
-            detected_tracks.add(track_id)
+        for r in res[0].boxes:
+            if not r.id: continue
+            tid = int(r.id)
+            bb = r.xyxy[0].cpu().numpy()
+            dt.add(tid)
             
-            # Initialize Kalman if new
-            if tracks[track_id]['kalman'] is None:
-                tracks[track_id]['kalman'] = KalmanFilter()
-                measurement = np.array([bbox[0], bbox[1], bbox[2] - bbox[0], bbox[3] - bbox[1]], np.float32)
-                tracks[track_id]['kalman'].kf.statePost = np.concatenate((measurement, [0, 0, 0, 0])).astype(np.float32)
+            if tracks[tid]['kal'] is None:
+                tracks[tid]['kal'] = KalmanFilter()
+                meas = np.array([bb[0], bb[1], bb[2]-bb[0], bb[3]-bb[1]], np.float32)
+                tracks[tid]['kal'].kf.statePost = np.concatenate((meas, [0]*4)).astype(np.float32)
             
-            # Update Kalman with detection
-            measurement = np.array([bbox[0], bbox[1], bbox[2] - bbox[0], bbox[3] - bbox[1]], np.float32)
-            tracks[track_id]['kalman'].update(measurement)
-            tracks[track_id]['last_detection'] = bbox
-            tracks[track_id]['missed_frames'] = 0
+            meas = np.array([bb[0], bb[1], bb[2]-bb[0], bb[3]-bb[1]], np.float32)
+            tracks[tid]['kal'].update(meas)
+            tracks[tid]['ld'] = bb
+            tracks[tid]['mf'] = 0
             
-            tracks[track_id]['frame_count'] += 1
+            tracks[tid]['fc'] += 1
             
-            # Attempt embedding every skip_interval frames
-            if tracks[track_id]['frame_count'] % args.skip_interval == 0:
-                # Crop upper body/head with padding
-                person_h = bbox[3] - bbox[1]
-                person_w = bbox[2] - bbox[0]
-                pad_h = person_h * args.padding_ratio
-                pad_w = person_w * args.padding_ratio
-                crop_y1 = max(0, int(bbox[1] - pad_h))
-                crop_y2 = min(height, int(bbox[1] + person_h * args.upper_crop_ratio + pad_h))
-                crop_x1 = max(0, int(bbox[0] - pad_w))
-                crop_x2 = min(width, int(bbox[2] + pad_w))
+            if tracks[tid]['fc'] % args.skip_interval == 0:
+                ph, pw = bb[3]-bb[1], bb[2]-bb[0]
+                phd, pwd = ph * args.padding_ratio, pw * args.padding_ratio
+                cy1 = max(0, int(bb[1] - phd))
+                cy2 = min(h, int(bb[1] + ph * args.upper_crop_ratio + phd))
+                cx1 = max(0, int(bb[0] - pwd))
+                cx2 = min(w, int(bb[2] + pwd))
                 
-                if (crop_y2 - crop_y1 < args.min_crop_size) or (crop_x2 - crop_x1 < args.min_crop_size):
-                    logging.debug(f"Frame {frame_num}, Track {track_id}: Crop too small, skipping.")
-                    continue
+                if (cy2 - cy1 < args.min_crop_size) or (cx2 - cx1 < args.min_crop_size): continue
                 
-                crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]  # BGR np array
+                cr = frame[cy1:cy2, cx1:cx2]  # BGR np
                 
-                # InsightFace embedding (detection + alignment + normed emb)
-                emb = get_embedding(bgr_np_image=crop, model_name=args.model_name, det_thresh=args.det_thresh)
-                if emb is None:
-                    logging.debug(f"Frame {frame_num}, Track {track_id}: No face detected in crop.")
-                    continue
+                emb = get_embedding(bgr_np_image=cr, model_name=args.model_name, det_thresh=args.det_thresh)
+                if emb is None: continue
                 
-                tracks[track_id]['embeddings'].append(emb)
-                logging.debug(f"Frame {frame_num}, Track {track_id}: Added embedding (total {len(tracks[track_id]['embeddings'])})")
+                tracks[tid]['embs'].append(emb)
             
-            # Match/Re-ID if enough embeddings
-            if len(tracks[track_id]['embeddings']) >= args.min_embs_for_match:
-                avg_emb = np.mean(tracks[track_id]['embeddings'], axis=0)
+            if len(tracks[tid]['embs']) >= args.min_embs_for_match:
+                ae = np.mean(tracks[tid]['embs'], axis=0)
                 
-                # Find best DB match
-                max_db_sim = -1
-                best_name = None
-                for name, db_emb in db_embeddings.items():
-                    sim = cosine_similarity(avg_emb, db_emb)
-                    if sim > max_db_sim:
-                        max_db_sim = sim
-                        best_name = name
-                name = best_name if max_db_sim > args.cos_threshold else None
-                if name:
-                    logging.info(f"Frame {frame_num}, Track {track_id}: DB match to {name} (sim={max_db_sim:.2f})")
+                mds = -1
+                bn = None
+                for n, de in db_embs.items():
+                    s = cosine_similarity(ae, de)
+                    if s > mds:
+                        mds = s
+                        bn = n
+                nm = bn if mds > args.cos_threshold else None
+                if nm:
+                    logging.info(f"F {fn}, T {tid}: Match {nm} (s={mds:.2f})")
                 
-                # Re-ID: Check if matches a known person
-                matched_pid = None
-                max_reid_sim = -1
-                for pid, data in known_persons.items():
-                    if data['avg_emb'] is not None:
-                        sim = cosine_similarity(avg_emb, data['avg_emb'])
-                        if sim > args.reid_threshold and sim > max_reid_sim:
-                            if (data['name'] == name) or (data['name'] is None and name is None):
-                                matched_pid = pid
-                                max_reid_sim = sim
+                mp = None
+                mrs = -1
+                for p, d in known_p.items():
+                    if d['avg_emb'] is not None:
+                        s = cosine_similarity(ae, d['avg_emb'])
+                        if s > args.reid_threshold and s > mrs:
+                            if (d['name'] == nm) or (d['name'] is None and nm is None):
+                                mp = p
+                                mrs = s
                                 break
-                            elif sim > max_reid_sim:
-                                matched_pid = pid
-                                max_reid_sim = sim
+                            elif s > mrs:
+                                mp = p
+                                mrs = s
                 
-                if matched_pid is not None:
-                    # Merge to existing person
-                    tracks[track_id]['person_id'] = matched_pid
-                    old_emb = known_persons[matched_pid]['avg_emb']
-                    known_persons[matched_pid]['avg_emb'] = (old_emb + avg_emb) / 2
-                    if name and known_persons[matched_pid]['name'] is None:
-                        known_persons[matched_pid]['name'] = name
-                    known_persons[matched_pid]['last_score'] = max_db_sim if name else None
-                    logging.info(f"Frame {frame_num}, Track {track_id}: Re-ID matched to Person {matched_pid} (sim={max_reid_sim:.2f})")
+                if mp is not None:
+                    tracks[tid]['pid'] = mp
+                    oe = known_p[mp]['avg_emb']
+                    known_p[mp]['avg_emb'] = (oe + ae) / 2
+                    if nm and known_p[mp]['name'] is None:
+                        known_p[mp]['name'] = nm
+                    known_p[mp]['last_score'] = mds if nm else None
+                    logging.info(f"F {fn}, T {tid}: Re-ID {mp} (s={mrs:.2f})")
                 else:
-                    # New person
-                    person_id = next_person_id
-                    next_person_id += 1
-                    known_persons[person_id] = {'avg_emb': avg_emb, 'name': name, 'last_score': max_db_sim if name else None}
-                    tracks[track_id]['person_id'] = person_id
-                    logging.info(f"Frame {frame_num}, Track {track_id}: New Person {person_id}")
+                    pid = next_pid
+                    next_pid += 1
+                    known_p[pid] = {'avg_emb': ae, 'name': nm, 'last_score': mds if nm else None}
+                    tracks[tid]['pid'] = pid
+                    logging.info(f"F {fn}, T {tid}: New P {pid}")
         
-        # Handle missed detections with Kalman prediction
-        for track_id, state in list(tracks.items()):
-            if track_id not in detected_tracks:
-                if state['kalman'] is not None and state['missed_frames'] < args.max_missed_frames:
-                    predicted = state['kalman'].predict()
-                    pred_x1, pred_y1, pred_w, pred_h = predicted[:4]
-                    pred_bbox = np.array([pred_x1, pred_y1, pred_x1 + pred_w, pred_y1 + pred_h])
-                    state['last_detection'] = pred_bbox
-                    state['missed_frames'] += 1
+        for tid, s in list(tracks.items()):
+            if tid not in dt:
+                if s['kal'] and s['mf'] < args.max_missed_frames:
+                    pr = s['kal'].predict()
+                    px1, py1, pw, ph = pr[:4]
+                    pb = np.array([px1, py1, px1 + pw, py1 + ph])
+                    s['ld'] = pb
+                    s['mf'] += 1
                 else:
-                    # Remove old tracks
-                    del tracks[track_id]
+                    del tracks[tid]
                     continue
             
-            # Annotate using last_detection (detected or predicted)
-            bbox = state['last_detection']
-            if bbox is not None:
-                pid = state['person_id']
+            bb = s['ld']
+            if bb is not None:
+                pid = s['pid']
                 if pid is None:
-                    label = "No face detected"
-                    score = None
-                    display_id = track_id
+                    lb = "No face detected"
+                    sc = None
+                    did = tid
                 else:
-                    person_data = known_persons[pid]
-                    label = person_data['name'] if person_data['name'] else "Unknown"
-                    score = person_data['last_score']
-                    display_id = pid
+                    pd = known_p[pid]
+                    lb = pd['name'] if pd['name'] else "Unknown"
+                    sc = pd['last_score']
+                    did = pid
                 
-                # Color-coding
-                if label != "Unknown" and label != "No face detected":  # Matched
-                    color = (0, 255, 0)  # Green
-                elif label == "Unknown":
-                    color = (0, 255, 255)  # Yellow
+                if lb != "Unknown" and lb != "No face detected":
+                    col = (0, 255, 0)
+                elif lb == "Unknown":
+                    col = (0, 255, 255)
                 else:
-                    color = (0, 0, 255)  # Red
+                    col = (0, 0, 255)
                 
-                # Append score if matched
-                display_label = f"Person {display_id}: {label}"
-                if score is not None:
-                    display_label += f" ({score:.2f})"
+                dlb = f"P {did}: {lb}"
+                if sc is not None:
+                    dlb += f" ({sc:.2f})"
                 
-                # Draw bbox and text
-                cv2.rectangle(orig_frame, (int(bbox[0]), int(bbox[1])), (int(bbox[2]), int(bbox[3])), color, 2)
-                cv2.putText(orig_frame, display_label, (int(bbox[0]), int(bbox[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                cv2.rectangle(of, (int(bb[0]), int(bb[1])), (int(bb[2]), int(bb[3])), col, 2)
+                cv2.putText(of, dlb, (int(bb[0]), int(bb[1]) - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, col, 2)
                 
-                # Verbose: Print bbox
                 if args.verbose:
-                    logging.debug(f"Frame {frame_num}, Track {track_id}: BBox {bbox}")
+                    logging.debug(f"F {fn}, T {tid}: BB {bb}")
         
-        # Timing: FPS in top-right
-        frame_time = time.time() - frame_start
-        frame_times.append(frame_time)
-        avg_fps = 1 / (sum(frame_times) / len(frame_times)) if frame_times else 0
-        cv2.putText(orig_frame, f"FPS: {avg_fps:.1f}", (width - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        ft_ = time.time() - fs
+        ft.append(ft_)
+        afps = 1 / (sum(ft) / len(ft)) if ft else 0
+        cv2.putText(of, f"FPS: {afps:.1f}", (w - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
-        # Resources: GPU mem (if CUDA) and CPU % in bottom-left
         if 'cuda' in args.device:
-            gpu_used = torch.cuda.memory_allocated() / 1024**2
-            gpu_total = torch.cuda.get_device_properties(0).total_memory / 1024**2
-            gpu_str = f"GPU: {gpu_used:.0f}/{gpu_total:.0f} MB"
+            gu = torch.cuda.memory_allocated() / 1024**2
+            gt = torch.cuda.get_device_properties(0).total_memory / 1024**2
+            gs = f"GPU: {gu:.0f}/{gt:.0f} MB"
         else:
-            gpu_str = "GPU: N/A"
-        cpu_percent = psutil.cpu_percent()
-        resource_text = f"{gpu_str} | CPU: {cpu_percent:.1f}%"
-        cv2.putText(orig_frame, resource_text, (10, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            gs = "GPU: N/A"
+        cp = psutil.cpu_percent()
+        rt = f"{gs} | CPU: {cp:.1f}%"
+        cv2.putText(of, rt, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
-        out.write(orig_frame)
+        out.write(of)
         
-        # Batch log summary every 100 frames
-        if frame_num % 200 == 0:
-            logging.info(f"Processed {frame_num} frames, active tracks: {len(tracks)}")
+        if fn % 100 == 0:
+            logging.info(f"Proc {fn} f, act t: {len(tracks)}")
     
     cap.release()
     out.release()
-    logging.info(f"Processed video saved to {args.output_video_path}")
+    logging.info(f"Saved to {args.output_video_path}")
