@@ -1,5 +1,3 @@
-import torch.nn.functional as F
-import torch
 import os
 import numpy as np
 import json
@@ -12,6 +10,7 @@ import time
 from convert import get_embedding
 import warnings
 from kalmanfilter import KalmanFilter
+import torch
 
 # Suppress specific warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -35,7 +34,7 @@ def process_video(args):
     if not db_embs:
         raise ValueError("Empty DB")
     
-    yolo = YOLO('yolov8m.pt') ### can change 
+    yolo = YOLO('yolov8m.pt')
     
     cap = cv2.VideoCapture(args.video_path)
     if not cap.isOpened():
@@ -59,8 +58,13 @@ def process_video(args):
         fn += 1
         of = frame.copy()
         
+        # YOLO tracking time
+        tracking_start = time.time()
         res = yolo.track(frame, persist=True, classes=0, conf=args.conf_threshold, iou=args.iou_threshold)
+        tracking_time = time.time() - tracking_start
         
+        # Recognition pipeline time (excluding vis)
+        pipeline_start = time.time()
         dt = set()
         
         for r in res[0].boxes:
@@ -183,20 +187,34 @@ def process_video(args):
                 if args.verbose:
                     logging.debug(f"F {fn}, T {tid}: BB {bb}")
         
-        ft_ = time.time() - fs
-        ft.append(ft_)
-        afps = 1 / (sum(ft) / len(ft)) if ft else 0
-        cv2.putText(of, f"FPS: {afps:.1f}", (w - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        # FPS calculations (excluding vis)
+        pipeline_time = time.time() - pipeline_start  # Recognition only
+        whole_inference_time = tracking_time + pipeline_time  # YOLO + recognition
+        tracking_fps = 1 / tracking_time if tracking_time > 0 else 0
+        whole_fps = 1 / whole_inference_time if whole_inference_time > 0 else 0
         
+        # Display FPS in red
+        cv2.putText(of, f"Tracking FPS: {tracking_fps:.1f}", (w - 250, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(of, f"Pipeline FPS: {whole_fps:.1f}", (w - 250, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # Resources (GPU/CPU/RAM) in white, bottom, 2 lines
         if 'cuda' in args.device:
             gu = torch.cuda.memory_allocated() / 1024**2
             gt = torch.cuda.get_device_properties(0).total_memory / 1024**2
-            gs = f"GPU: {gu:.0f}/{gt:.0f} MB"
+            gpu_util = torch.cuda.utilization(0) if hasattr(torch.cuda, 'utilization') else 0  # % utilization
+            gpu_vram = f"GPU: {gt:.0f} MB"
+            gpu_usage = f"({gpu_util}%)"
         else:
-            gs = "GPU: N/A"
+            gpu_vram = "GPU: N/A"
+            gpu_usage = "N/A"
+        
         cp = psutil.cpu_percent()
-        rt = f"{gs} | CPU: {cp:.1f}%"
-        cv2.putText(of, rt, (10, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        ram = psutil.virtual_memory().percent
+        cpu_ram_line = f"CPU: {cp:.1f}% | RAM: {ram:.1f}%"
+        
+        # Display on 2 lines
+        cv2.putText(of, f"{gpu_vram} | {gpu_usage}", (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(of, cpu_ram_line, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         out.write(of)
         
