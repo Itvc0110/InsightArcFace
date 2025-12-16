@@ -35,7 +35,7 @@ def process_video(args):
     if not db_embs:
         raise ValueError("Empty DB")
     
-    yolo = YOLO('yolov8m.pt')
+    yolo = YOLO('yolov8m.pt') ### can change 
     
     cap = cv2.VideoCapture(args.video_path)
     if not cap.isOpened():
@@ -186,7 +186,7 @@ def process_video(args):
         ft_ = time.time() - fs
         ft.append(ft_)
         afps = 1 / (sum(ft) / len(ft)) if ft else 0
-        cv2.putText(of, f"FPS: {afps:.1f}", (w - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(of, f"FPS: {afps:.1f}", (w - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         
         if 'cuda' in args.device:
             gu = torch.cuda.memory_allocated() / 1024**2
