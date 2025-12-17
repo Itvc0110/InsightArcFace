@@ -199,22 +199,19 @@ def process_video(args):
         
         # Resources (GPU/CPU/RAM) in white, bottom, 2 lines
         if 'cuda' in args.device:
-            gu = torch.cuda.memory_allocated() / 1024**2
-            gt = torch.cuda.get_device_properties(0).total_memory / 1024**2
-            gpu_util = torch.cuda.utilization(0) if hasattr(torch.cuda, 'utilization') else 0  # % utilization
-            gpu_vram = f"GPU: {gt:.0f} MB"
-            gpu_usage = f"({gpu_util}%)"
+            gu = torch.cuda.memory_allocated() / 1024**2  # Used in MB
+            gt = torch.cuda.get_device_properties(0).total_memory / 1024**2  # Total in MB
+            gpu_util = torch.cuda.utilization(0) if hasattr(torch.cuda, 'utilization') else 0  # Compute %
+            gpu_vram = f"{gu:.0f} / {gt / 1024:.0f} GB"
+            gpu_usage = f" | Usage: {gpu_util}%"
         else:
             gpu_vram = "GPU: N/A"
-            gpu_usage = "N/A"
+            gpu_usage = " | Usage: N/A"
         
         cp = psutil.cpu_percent()
         ram = psutil.virtual_memory().percent
-        cpu_ram_line = f"CPU: {cp:.1f}% | RAM: {ram:.1f}%"
-        
-        # Display on 2 lines
-        cv2.putText(of, f"{gpu_vram} | {gpu_usage}", (10, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(of, cpu_ram_line, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        rt = f"{gpu_vram}{gpu_usage} | CPU: {cp:.1f}% | RAM: {ram:.1f}%"
+        cv2.putText(of, rt, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
         out.write(of)
         
