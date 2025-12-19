@@ -102,7 +102,7 @@ def process_video(args):
                 
                 tracks[tid]['embs'].append(emb)
             
-            if len(tracks[tid]['embs']) >= args.min_embs_for_match or (tracks[tid]['fc'] % 20 == 0 and len(tracks[tid]['embs'] > 0)):
+            if len(tracks[tid]['embs']) >= args.min_embs_for_match or (tracks[tid]['fc'] % 20 == 0 and len(tracks[tid]['embs']) > 0):
                 ae = np.mean(tracks[tid]['embs'], axis=0)
                 
                 mds = -1
@@ -208,7 +208,7 @@ def process_video(args):
                     # No reliable emb → keep primary, delete dupe
                     del tracks[dupe_tid]
                     logging.info(f"F {fn}: Delete dupe T {dupe_tid} (no emb)")
-                    
+
         for tid, s in list(tracks.items()):
             if tid not in dt:
                 if s['kal'] and s['mf'] < args.max_missed_frames:
