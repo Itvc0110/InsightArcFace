@@ -30,11 +30,11 @@ def get_args():
     parser.add_argument('--min_embs_for_match', default=1, type=int, help='Min embeddings needed for matching')
     parser.add_argument('--min_crop_size', default=100, type=int, help='Min crop size in pixels')
     parser.add_argument('--max_embs_per_track', default=10, type=int, help='Max embeddings to average per track')
-    parser.add_argument('--reid_threshold', default=0.8, type=float, help='Cosine similarity threshold for re-ID')
     parser.add_argument('--verbose', action='store_true', help='Print detailed logs including bboxes every frame')
     parser.add_argument('--log_level', default='INFO', type=str, choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], help='Logging level')
     parser.add_argument('--max_missed_frames', default=3, type=int, help='Max frames to predict bbox before hiding')
     parser.add_argument('--det_thresh', default=0.35, type=float, help='Detection threshold for InsightFace')
+    parser.add_argument('--min_cos_for_update', default=0.05, type=float, help='Min cosine improvement for update')
     
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)

@@ -102,7 +102,7 @@ def process_video(args):
                 
                 tracks[tid]['embs'].append(emb)
             
-            if len(tracks[tid]['embs']) >= args.min_embs_for_match:
+            if len(tracks[tid]['embs']) >= args.min_embs_for_match or (tracks[tid]['fc'] % 20 == 0 and len(tracks[tid]['embs'] > 0)):
                 ae = np.mean(tracks[tid]['embs'], axis=0)
                 
                 mds = -1
@@ -121,7 +121,7 @@ def process_video(args):
                 for p, d in known_p.items():
                     if d['avg_emb'] is not None:
                         s = cosine_similarity(ae, d['avg_emb'])
-                        if s > args.reid_threshold and s > mrs:
+                        if s > mrs:  # Removed reid_threshold; now highest sim wins if compatible
                             if (d['name'] == nm) or (d['name'] is None and nm is None):
                                 mp = p
                                 mrs = s
@@ -145,6 +145,70 @@ def process_video(args):
                     tracks[tid]['pid'] = pid
                     logging.info(f"F {fn}, T {tid}: New P {pid}")
         
+        # Enforce max 1 ID per frame (max_id_per_frame = 1)
+        pid_to_tracks = defaultdict(list)
+        for tid in dt:
+            if tracks[tid]['pid'] is not None:
+                pid_to_tracks[tracks[tid]['pid']].append(tid)
+        
+        for pid, tlist in pid_to_tracks.items():
+            if len(tlist) <= 1:
+                continue  # No duplicate
+                
+            # Select primary: highest # embs → highest score → first
+            primary_tid = max(
+                tlist,
+                key=lambda tid: (
+                    len(tracks[tid]['embs']),  # Primary: most embeddings
+                    known_p[pid]['last_score'] if known_p[pid]['last_score'] is not None else -1,  # Then highest score
+                    tid  # Tiebreaker: lowest track ID (deterministic)
+                )
+            )
+            
+            primary_ae = np.mean(tracks[primary_tid]['embs'], axis=0) if tracks[primary_tid]['embs'] else None
+            
+            for dupe_tid in [t for t in tlist if t != primary_tid]:
+                dupe_ae = np.mean(tracks[dupe_tid]['embs'], axis=0) if tracks[dupe_tid]['embs'] else None
+                
+                if primary_ae is not None and dupe_ae is not None:
+                    sim = cosine_similarity(primary_ae, dupe_ae)
+                    
+                    if sim >= args.reid_threshold:
+                        # Merge: append dupe embs to primary (deque handles maxlen)
+                        for emb in tracks[dupe_tid]['embs']:
+                            tracks[primary_tid]['embs'].append(emb)
+                        
+                        # Update name/score if dupe has better (or primary lacks)
+                        if (known_p[pid]['name'] is None and 
+                            tracks[dupe_tid].get('name') is not None):  # You'd need to store per-track name temporarily if needed
+                            pass  # Or use known_p's current
+                        if (known_p[pid]['last_score'] is None or 
+                            tracks[dupe_tid].get('last_score', -1) > known_p[pid]['last_score']):
+                            pass  # Update if better
+                        
+                        # Optional: update kalman with dupe's last detection (average or latest)
+                        # For simplicity, keep primary's
+                        
+                        logging.info(f"F {fn}: Merge dupe T {dupe_tid} -> primary T {primary_tid} (sim={sim:.2f})")
+                        
+                        # Delete dupe track
+                        del tracks[dupe_tid]
+                    else:
+                        # Split: assign new pid to dupe
+                        new_pid = next_pid
+                        next_pid += 1
+                        known_p[new_pid] = {
+                            'avg_emb': dupe_ae,
+                            'name': known_p[pid]['name'],  # Inherit name (or None)
+                            'last_score': known_p[pid]['last_score']
+                        }
+                        tracks[dupe_tid]['pid'] = new_pid
+                        logging.info(f"F {fn}: Split dupe T {dupe_tid} -> New PID {new_pid} (sim={sim:.2f})")
+                else:
+                    # No reliable emb → keep primary, delete dupe
+                    del tracks[dupe_tid]
+                    logging.info(f"F {fn}: Delete dupe T {dupe_tid} (no emb)")
+                    
         for tid, s in list(tracks.items()):
             if tid not in dt:
                 if s['kal'] and s['mf'] < args.max_missed_frames:
