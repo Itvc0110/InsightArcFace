@@ -24,7 +24,7 @@ def get_args():
     parser.add_argument('--conf_threshold', default=0.5, type=float, help='YOLO confidence threshold')
     parser.add_argument('--iou_threshold', default=0.45, type=float, help='YOLO IoU threshold')
     parser.add_argument('--upper_crop_ratio', default=0.4, type=float, help='Fraction of person bbox for head crop')
-    parser.add_argument('--padding_ratio', default=0.2, type=float, help='Padding around crop')
+    parser.add_argument('--padding_ratio', default=0, type=float, help='Padding around crop')
     parser.add_argument('--skip_interval', default=5, type=int, help='Re-attempt embedding every N frames')
     parser.add_argument('--cos_threshold', default=0.6, type=float, help='Cosine similarity threshold for DB match')
     parser.add_argument('--min_embs_for_match', default=1, type=int, help='Min embeddings needed for matching')
@@ -35,6 +35,7 @@ def get_args():
     parser.add_argument('--max_missed_frames', default=3, type=int, help='Max frames to predict bbox before hiding')
     parser.add_argument('--det_thresh', default=0.35, type=float, help='Detection threshold for InsightFace')
     parser.add_argument('--min_cos_for_update', default=0.05, type=float, help='Min cosine improvement for update')
+    parser.add_argument('--reid_threshold', default=0.7, type=float, help='ReID cosine similarity threshold')
     
     args = parser.parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
